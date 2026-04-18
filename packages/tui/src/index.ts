@@ -1,3 +1,26 @@
+/**
+ * `@mariozechner/pi-tui` 的公共入口。
+ *
+ * 这是一个 **差分渲染** 的终端 UI 框架，重点面向 coding-agent 这类需要长时间流式
+ * 输出 + 可交互输入的 CLI。核心思路：
+ *
+ *  - `TUI` 维护一棵 `Component` 组件树（见 `./tui.ts`），每一帧先把需要重绘的组件
+ *    调用 `render(width)` 产出 `string[]`（每一项是一行，可含 ANSI 颜色 / 图像），
+ *    再和上一次的输出按行做 diff，仅重写变化的行，避免整屏闪烁。
+ *  - `Terminal` 是对 `process.stdin/stdout` 的薄封装（见 `./terminal.ts`），负责 raw
+ *    mode、bracketed paste、Kitty 键盘协议协商、窗口尺寸、光标定位等。
+ *  - 键盘输入统一成 `Key`（`./keys.ts`），并支持 Kitty 协议下的按键按下 / 释放 /
+ *    重复事件区分，以及 Windows 下 VT input 的启用。
+ *  - 组件库（`./components/*`）提供输入框、编辑器、选单、Markdown 渲染、图像、
+ *    loader 等常用件。
+ *  - 键位（`./keybindings.ts`）通过一张可配置的表统一管理，避免在组件里硬编码
+ *    `ctrl+x` 之类的逻辑（与仓库 `AGENTS.md` 的规则一致）。
+ *  - 终端图像（`./terminal-image.ts`）根据能力探测选择 Kitty / iTerm2 协议或纯
+ *    ASCII fallback。
+ *
+ * 此文件是 barrel：只做命名导出，让消费方可以 `import { TUI, ... } from "@mariozechner/pi-tui"`。
+ */
+
 // Core TUI interfaces and classes
 
 // Autocomplete support

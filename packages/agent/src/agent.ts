@@ -1,3 +1,28 @@
+/**
+ * `Agent` —— 有状态的 agent 封装。
+ *
+ * 这个模块把 `./agent-loop.ts` 里无状态的 `runAgentLoop` / `runAgentLoopContinue`
+ * 包装成一个易用的对象：
+ *
+ *  - 把 transcript（`messages`）、工具列表（`tools`）、模型与系统提示等放进
+ *    `AgentState`，并用一个可变的 `MutableAgentState` 内部管理可写字段。
+ *  - 用 `subscribe()` 注册的监听器接收 `AgentEvent` 流；`agent_end` 之后 `Agent`
+ *    不会立即空闲，要等所有监听器对该事件 await 完，再通过 `finishRun()` 解除
+ *    `activeRun` 并把流式相关状态清空。
+ *  - 提供两类消息队列：
+ *      * **steering 队列**：会在下一次 LLM 回复之前注入（典型场景：用户边等
+ *        agent 回复边继续输入）。
+ *      * **follow-up 队列**：在 agent 本来打算结束（没有更多 tool call）时，把
+ *        排队的消息作为新一轮驱动重新进入 loop。
+ *    两种队列各自支持 `"all"`（一次全部排出）和 `"one-at-a-time"`（每轮只取
+ *    队头一条）两种 drain 模式。
+ *  - 通过 `prompt(...)` 启动新一轮；通过 `continue()` 基于当前 transcript 继续
+ *    （最后一条必须是 `user` 或 `toolResult`，否则会从 steering/follow-up 队列
+ *    尝试补一条可继续的消息）。
+ *  - 运行中可调用 `abort()` 主动终止；失败时会把错误包装成一个 `stopReason` 为
+ *    `"error"` 或 `"aborted"` 的助手消息写入 transcript，并触发 `agent_end`。
+ */
+
 import {
 	type ImageContent,
 	type Message,
@@ -24,12 +49,18 @@ import type {
 	ToolExecutionMode,
 } from "./types.js";
 
+/**
+ * 默认的 `AgentMessage[] -> Message[]` 转换：直接过滤掉任何不是 user /
+ * assistant / toolResult 的消息，其它角色由使用方在自定义 `convertToLlm`
+ * 里决定如何折叠进 LLM 上下文。
+ */
 function defaultConvertToLlm(messages: AgentMessage[]): Message[] {
 	return messages.filter(
 		(message) => message.role === "user" || message.role === "assistant" || message.role === "toolResult",
 	);
 }
 
+/** 构造失败消息时使用的零值用量，避免下游对 `usage` 做可选判断。 */
 const EMPTY_USAGE = {
 	input: 0,
 	output: 0,
@@ -39,6 +70,7 @@ const EMPTY_USAGE = {
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
 
+/** 构造失败消息时的占位模型；真正的模型信息在 `AgentState.model` 上。 */
 const DEFAULT_MODEL = {
 	id: "unknown",
 	name: "unknown",
@@ -52,6 +84,11 @@ const DEFAULT_MODEL = {
 	maxTokens: 0,
 } satisfies Model<any>;
 
+/**
+ * 消息队列的排出策略：
+ *  - `"all"`：一次把队列中的所有消息全部取出，一起注入。
+ *  - `"one-at-a-time"`：每次只取队头一条，其余留到下一轮。
+ */
 type QueueMode = "all" | "one-at-a-time";
 
 type MutableAgentState = Omit<AgentState, "isStreaming" | "streamingMessage" | "pendingToolCalls" | "errorMessage"> & {
@@ -61,6 +98,11 @@ type MutableAgentState = Omit<AgentState, "isStreaming" | "streamingMessage" | "
 	errorMessage?: string;
 };
 
+/**
+ * 构造一个内部使用的可变状态对象。对外的 `AgentState` 是只读视图，但
+ * `tools` / `messages` 两个数组通过 setter 会被拷贝一份，避免外部引用被
+ * 篡改导致 loop 内外状态不一致。
+ */
 function createMutableAgentState(
 	initialState?: Partial<Omit<AgentState, "pendingToolCalls" | "isStreaming" | "streamingMessage" | "errorMessage">>,
 ): MutableAgentState {
@@ -110,6 +152,10 @@ export interface AgentOptions {
 	toolExecution?: ToolExecutionMode;
 }
 
+/**
+ * 轻量的消息队列。根据 `mode` 在 `drain()` 时决定是一次性排空还是只取
+ * 队头一条。steering / follow-up 共用同一实现，只是行为不同。
+ */
 class PendingMessageQueue {
 	private messages: AgentMessage[] = [];
 
@@ -143,6 +189,11 @@ class PendingMessageQueue {
 	}
 }
 
+/**
+ * 当前活跃的一次 `prompt()` / `continue()` 运行：
+ *  - `promise` 在 `finishRun()` 里被 `resolve()`，`waitForIdle()` 返回它。
+ *  - `abortController` 是本次运行的取消源，`abort()` 仅作用于这一次运行。
+ */
 type ActiveRun = {
 	promise: Promise<void>;
 	resolve: () => void;

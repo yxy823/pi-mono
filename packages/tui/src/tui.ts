@@ -1,5 +1,24 @@
 /**
- * Minimal TUI implementation with differential rendering
+ * 差分渲染的终端 UI 核心实现。
+ *
+ * 设计要点：
+ *
+ *  - `Component` 是最小粒度：每次重绘时 TUI 会调用 `render(width)` 拿到一串行；
+ *    组件无需自己处理“清屏 / 光标移动”，TUI 负责按行 diff 并只重写变化行。
+ *  - `Container` / `TUI` 在组件之上组装出树，负责布局（块级流式纵向堆叠）、
+ *    焦点（`Focusable`）、按键派发、overlay（浮层 / 弹窗）等。
+ *  - 渲染到终端时使用 `Terminal.write` 一次性输出已经用 `\x1b[...` 序列计算好的
+ *    差分结果，减少刷新抖动。
+ *  - `CURSOR_MARKER` 是一个零宽的 APC 序列，聚焦组件在自己的渲染输出里写在光标
+ *    应出现的位置；TUI 在输出前把它剥离并把硬件光标（方便 IME 候选框定位）
+ *    摆到对应位置。
+ *  - 键盘输入通过 `Terminal.start` 回调到来，经过 `matchesKey` 等与 `keybindings`
+ *    配合做统一派发，避免在具体组件里硬编码键位。
+ *  - 终端能力（Kitty / iTerm2 图像、键盘协议）在第一次渲染前查询一次，作为全局
+ *    状态供组件参考。
+ *
+ * 此文件包含 `Component`、`Focusable`、`Container`、overlay 相关类型，以及 `TUI`
+ * 类本身。它本身不依赖任何具体 UI 组件，所有组件都在 `./components/*`。
  */
 
 import * as fs from "node:fs";

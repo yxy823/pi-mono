@@ -1,3 +1,25 @@
+/**
+ * `Terminal` —— TUI 使用的 **最小终端抽象**，以及用 `process.stdin/stdout`
+ * 实现的默认版本 `ProcessTerminal`。
+ *
+ * 职责：
+ *
+ *  - 开启 / 恢复 raw mode，并在 start 时启用 bracketed paste、Kitty 键盘协议
+ *    协商、Windows 下的 `ENABLE_VIRTUAL_TERMINAL_INPUT`，让上层可以拿到完整的
+ *    修饰键信息（Ctrl / Shift / Alt）。
+ *  - 用 `StdinBuffer` 把一次性到达的多条转义序列拆开，保证 `matchesKey` /
+ *    `isKeyRelease` 等只处理单条序列；在 buffer 里顺便探测 Kitty 协议响应。
+ *  - 对外暴露最少必要的 API：`write`、`columns/rows`、`moveBy`、`clearLine` /
+ *    `clearScreen` 等，供 `TUI` 做差分渲染时使用。
+ *  - `drainInput()` 在退出前尽量清空 stdin，避免 Kitty 协议的 key release 事件
+ *    经慢速 SSH 回显到父 shell。
+ *  - `PI_TUI_WRITE_LOG` 环境变量：可选地把所有写入终端的字节追加到文件，便于
+ *    调试 TUI 输出。
+ *
+ * 这里故意只定义一个 `Terminal` 接口而不是把 `process.*` 硬编码进 TUI，是为了
+ * 方便测试和跨场景（比如未来的 pipe / web sink）替换实现。
+ */
+
 import * as fs from "node:fs";
 import { createRequire } from "node:module";
 import * as path from "node:path";
@@ -7,7 +29,7 @@ import { StdinBuffer } from "./stdin-buffer.js";
 const cjsRequire = createRequire(import.meta.url);
 
 /**
- * Minimal terminal interface for TUI
+ * TUI 使用的最小终端接口。实现者负责维护底层 raw mode / 输入协议等状态。
  */
 export interface Terminal {
 	// Start the terminal with input and resize handlers
