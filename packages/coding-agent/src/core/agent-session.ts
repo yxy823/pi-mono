@@ -1,16 +1,44 @@
 /**
- * AgentSession - Core abstraction for agent lifecycle and session management.
+ * `AgentSession` —— coding-agent 的 **核心会话对象**，在互动、打印、RPC
+ * 等所有模式下共享。
  *
- * This class is shared between all run modes (interactive, print, rpc).
- * It encapsulates:
- * - Agent state access
- * - Event subscription with automatic session persistence
- * - Model and thinking level management
- * - Compaction (manual and auto)
- * - Bash execution
- * - Session switching and branching
+ * 概念层次：
  *
- * Modes use this class and add their own I/O layer on top.
+ *   pi-ai.streamSimple()  ← 模型调用
+ *        ↑
+ *   pi-agent-core.Agent   ← 底层 agent loop 与状态
+ *        ↑
+ *   AgentSession          ← **本文件**：在 Agent 之上叠加会话、持久化、
+ *                            工具注册、拓展系统、压缩与分支摘要、bash 执行等
+ *        ↑
+ *   modes/ (interactive / print / rpc)
+ *
+ * 本类封装的能力：
+ *
+ *  - **事件订阅与持久化**：向 `agent.subscribe(...)` 挂钩子，将消息 / 工具调用
+ *    / turn 边界写回 `SessionManager`，同时将事件扩展成 `AgentSessionEvent`
+ *    （添加队列快照、压缩、自动重试等会话级别的事件）分发给模式层监听器。
+ *  - **模型与思考等级**：`cycleModel()` 在 `--models` 为你定义的 scoped
+ *    列表中循环；`supportsXhigh` 决定 `xhigh` 是否在当前模型下出现。
+ *  - **压缩（compaction）**：手动 / 阈值 / overflow 三种触发场景共用同一条
+ *    管道，在不丢弃当前 turn 的前提下把早期消息折叠成摘要。
+ *  - **分支摘要（branch summary）**：在用户“划到历史某次消息再输入”产生分支
+ *    时生成简短摘要，让后续模型知道前分支发生过什么。
+ *  - **Bash 执行**：从模式层的 slash command（如 `/sh`）直接跑 bash，并把结果
+ *    编织成下一轮 prompt 的上下文消息。
+ *  - **Steering / follow-up 队列镜像**：除了 Agent 内部的队列，这里还维护了
+ *    一份 UI 侧的字符串快照，用于在界面上展示“没进去之前排队的消息”。
+ *  - **Pending next-turn 信息**：自定义 / 扩展的消息（如那些在下次 user prompt
+ *    一起发送的“aside”上下文）暂存在这里，等真正的 prompt 出发时被推到
+ *    transcript 和模型上下文里。
+ *  - **拓展系统（extensions）**：`ExtensionRunner` 的 host。拓展可以插入工具定义
+ *    、产生 slash command、匹配 session 的 hook。本类提供注册 / 卸载 / 错误
+ *    隔离语义，并向拓展暴露 `ExtensionUIContext` 、命令上下文动作等。
+ *  - **自动重试**：模型对话失败时，按指数退避发起有限次数的 `continue()`
+ *    重试，并对外发送 `auto_retry_start` / `auto_retry_end`。
+ *
+ * 设计上 **I/O 不在这个类里**：它不把消息打印到屏幕、不读写 stdin。真正的渲染
+ * 与用户输入在 `modes/*` 中实现，他们以订阅者的身份去消费会话事件。
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -85,7 +113,10 @@ import { createToolDefinitionFromAgentTool, wrapToolDefinition } from "./tools/t
 // Skill Block Parsing
 // ============================================================================
 
-/** Parsed skill block from a user message */
+/**
+ * 从用户消息文本中解析出的一个 `<skill name="..." location="...">...</skill>`
+ * 块。skill 是 pi 用户可撰写的文件形式的小拓展。
+ */
 export interface ParsedSkillBlock {
 	name: string;
 	location: string;
@@ -94,8 +125,15 @@ export interface ParsedSkillBlock {
 }
 
 /**
- * Parse a skill block from message text.
- * Returns null if the text doesn't contain a skill block.
+ * 从用户消息文本中尝试解析一个 skill 块。块格式大致为：
+ *
+ *   <skill name="xxx" location="/path">
+ *   正文
+ *   </skill>
+ *
+ *   可选的用户附带消息。
+ *
+ * 如果格式不匹配则返回 `null`，让上游按普通用户消息处理。
  */
 export function parseSkillBlock(text: string): ParsedSkillBlock | null {
 	const match = text.match(/^<skill name="([^"]+)" location="([^"]+)">\n([\s\S]*?)\n<\/skill>(?:\n\n([\s\S]+))?$/);
@@ -108,7 +146,10 @@ export function parseSkillBlock(text: string): ParsedSkillBlock | null {
 	};
 }
 
-/** Session-specific events that extend the core AgentEvent */
+/**
+ * 会话级事件类型：在底层 `AgentEvent` 基础上扩展了 `AgentSession` 自己
+ * 产生的几种事件：队列快照更新、压缩开始 / 结束、自动重试开始 / 结束。
+ */
 export type AgentSessionEvent =
 	| AgentEvent
 	| {
@@ -231,6 +272,15 @@ const THINKING_LEVELS_WITH_XHIGH: ThinkingLevel[] = ["off", "minimal", "low", "m
 // AgentSession Class
 // ============================================================================
 
+/**
+ * 在 `Agent`（来自 `@mariozechner/pi-agent-core`）上叠加会话语义、持久化、
+ * 压缩 / 分支摘要 / bash 执行 / 拓展系统 / 自动重试等能力的上层运行时。
+ *
+ * 所有模式（interactive / print / rpc）都读同一个 `AgentSession`，各自以自己的
+ * 方式渲染 / 取输入。与 `Agent` 不同的是，本类主动把事件持久化到
+ * `SessionManager`，并在这里维护各种取消控制器以便可以分项中断压缩 /
+ * 分支摘要 / 重试 / bash 等并行的业务。
+ */
 export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;

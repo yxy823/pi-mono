@@ -1,4 +1,26 @@
 #!/usr/bin/env node
+/**
+ * `pi-mom` 的进程入口。
+ *
+ * `mom`（Messages-Over-coding-agent）是一个 Slack bot，把 Slack 消息翻译成针对
+ * coding-agent 的 prompt，并在可选的沙箱（host / docker / VM）里执行，然后把
+ * 结果流回 Slack。
+ *
+ * 本文件职责：
+ *
+ *  1. 解析 CLI：工作目录、沙箱配置（`--sandbox host|docker=...|vm=...`）、可选的
+ *     `--download <channel>` 一次性下载某个频道最近的附件。
+ *  2. 校验环境：`MOM_SLACK_APP_TOKEN` + `MOM_SLACK_BOT_TOKEN` 是否齐全；沙箱配置
+ *     是否有效。
+ *  3. 打开 `ChannelStore`（把频道 → 本地工作目录和历史映射持久化到 `~/.pi/mom`）。
+ *  4. 创建 `SlackBot` 并注册 `MomHandler`：处理 `app_mention` / 线程回复 / 文件上传
+ *     等事件。每条消息经过“频道去抖”后合并为一次 `AgentRunner.run(...)` 调用。
+ *  5. 管理生命周期：捕获 `SIGINT/SIGTERM` 优雅关闭、统一的 event watcher 写入
+ *     `~/.pi/mom/events.jsonl` 供离线回放。
+ *
+ * 真正的 agent 行为在 `./agent.ts` 中（使用 `pi-coding-agent` 的 `AgentSession`）。
+ * 本文件只做 IO 与编排。
+ */
 
 import { join, resolve } from "path";
 import { type AgentRunner, getOrCreateRunner } from "./agent.js";

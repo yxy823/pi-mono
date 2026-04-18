@@ -1,3 +1,28 @@
+/**
+ * `pi-mom` 的 agent 适配层。
+ *
+ * 本文件把 **Slack 的频道 / 线程 / 消息** 桥接到 **`pi-coding-agent` 的
+ * `AgentSession`**：
+ *
+ *  - 每个频道（或 thread）对应一个 `AgentRunner`，运行在自己的工作目录 +
+ *    自己的 `SessionManager`（会话文件落盘到 `~/.pi/mom/<channel>/...`），这样
+ *    多人同时在不同频道 @ bot 时互不干扰。
+ *  - `run(ctx, store, pendingMessages?)` 接收一批“还没被处理的 Slack 消息”，
+ *    把它们拼成一个用户 prompt（含多用户署名、附件），通过 `AgentSession.prompt`
+ *    驱动 agent 运行；运行期间再有新消息到来则通过 steering 队列并入。
+ *  - 处理附件：图片转成 `ImageContent`；文件 / 代码 / 日志写入沙箱工作目录后
+ *    以路径形式告知 agent。
+ *  - 沙箱：`createExecutor(sandboxConfig)` 产生一个 bash 执行器，对 agent 内
+ *    置的 `bash` / `edit` 等工具做透明替换，所有 side-effect 都落在 host /
+ *    docker / VM 沙箱里。
+ *  - 上传：通过 `setUploadFunction` 让 agent 创建的产物可以回传到 Slack 频道。
+ *  - 鉴权：从 `AuthStorage`（默认 `~/.pi/mom/auth.json`）读取 Anthropic API key。
+ *  - 日志同步：`syncLogToSessionManager` 把原始 Slack 事件 JSON 也写到 session
+ *    里，便于复现。
+ *
+ * 模型当前硬编码为 `claude-sonnet-4-5`（issue #63 跟踪可配置化）。
+ */
+
 import { Agent, type AgentEvent } from "@mariozechner/pi-agent-core";
 import { getModel, type ImageContent } from "@mariozechner/pi-ai";
 import {

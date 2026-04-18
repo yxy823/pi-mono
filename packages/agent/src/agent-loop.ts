@@ -1,6 +1,30 @@
 /**
- * Agent loop that works with AgentMessage throughout.
- * Transforms to Message[] only at the LLM call boundary.
+ * 无状态的 agent loop 实现。
+ *
+ * 设计原则：**在整个 loop 内部统一使用 `AgentMessage`**，仅在与 `@mariozechner/pi-ai`
+ * 的 `streamSimple` / `stream` 交互的那一个边界上，通过 `config.convertToLlm` 把
+ * `AgentMessage[]` 转成 `Message[]`。这样使用方可以在 transcript 中携带 LLM 无法
+ * 理解的角色（例如 UI 专用的 system / note 消息），同时保证发给模型的仅是
+ * 它能看懂的子集。
+ *
+ * 对外暴露三种调用方式：
+ *
+ *  - `agentLoop(prompts, ...)`               —— 新增一批用户 / 工具输入并启动 loop，
+ *                                                返回 `EventStream`（交互式流式消费）。
+ *  - `agentLoopContinue(context, ...)`       —— 基于现有 context 继续跑，最后一条消息
+ *                                                经 `convertToLlm` 转换后必须是 `user` 或
+ *                                                `toolResult`。
+ *  - `runAgentLoop` / `runAgentLoopContinue` —— 底层 async 版本，接受一个 `emit` 回调
+ *                                                直接推送事件（被 `Agent` 类使用）。
+ *
+ * 事件顺序从高层看是：
+ *
+ *   agent_start → [turn_start → message_* (包含流式 delta) →
+ *                  tool_execution_* (可选) → turn_end]×N → agent_end
+ *
+ * 其中每轮文本 / 思考 / tool call 的中间态都有并驱的 `partial` 消息，方便 UI 做
+ * 流式渲染。tool 执行可以并行或串行，由 `config.toolExecution` 以及单个 `AgentTool`
+ * 的 `executionMode` 共同决定。
  */
 
 import {
@@ -25,8 +49,11 @@ import type {
 export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
 
 /**
- * Start an agent loop with a new prompt message.
- * The prompt is added to the context and events are emitted for it.
+ * 以一批新 prompt 启动一个 agent loop。
+ *
+ * prompts 会先被附加到 context 后面，并对每一条推送 `message_start` / `message_end`
+ * 事件；随后进入正常的内部 loop。结果通过返回的 `EventStream` 以流式方式提供
+ * 所有中间事件，并在 `agent_end` 时给出本次追加的新消息数组。
  */
 export function agentLoop(
 	prompts: AgentMessage[],
@@ -54,12 +81,12 @@ export function agentLoop(
 }
 
 /**
- * Continue an agent loop from the current context without adding a new message.
- * Used for retries - context already has user message or tool results.
+ * 不添加新消息的情况下继续一个 agent loop（例如出错后的重试场景）。
  *
- * **Important:** The last message in context must convert to a `user` or `toolResult` message
- * via `convertToLlm`. If it doesn't, the LLM provider will reject the request.
- * This cannot be validated here since `convertToLlm` is only called once per turn.
+ * **重要：** `context.messages` 的最后一条经 `convertToLlm` 转换后必须是
+ * `user` 或 `toolResult`，否则上游 provider 会拒绝请求。这一点无法在这里预先
+ * 校验（`convertToLlm` 每轮只调一次），所以仅在进入时做一个 `assistant` 的
+ * 快速检查，剩下由调用方保证。
  */
 export function agentLoopContinue(
 	context: AgentContext,
@@ -150,7 +177,17 @@ function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
 }
 
 /**
- * Main loop logic shared by agentLoop and agentLoopContinue.
+ * `agentLoop` 和 `agentLoopContinue` 共用的主循环。
+ *
+ * 两层循环的静态结构：
+ *
+ *  - **内循环**：只要上一次助手回复产生了 tool call，或队列中还有待注入的
+ *    steering 消息，就继续交替“注入消息 → 流式产生 assistant 回复 → 执行工具”。
+ *  - **外循环**：内循环自然结束后，检查 follow-up 队列是否有消息；有则再进入
+ *    新一轮内循环，否则推送 `agent_end` 退出。
+ *
+ * 这么设计是为了同时支持两种交互：运行中用户插入的 steering 以及 agent 本来
+ * 要停了才轮到的 follow-up。
  */
 async function runLoop(
 	currentContext: AgentContext,
@@ -232,8 +269,18 @@ async function runLoop(
 }
 
 /**
- * Stream an assistant response from the LLM.
- * This is where AgentMessage[] gets transformed to Message[] for the LLM.
+ * 从 LLM 流式读取一个助手回复。这是 **唯一** 把 `AgentMessage[]` 折叠成
+ * `Message[]` 的边界。
+ *
+ * 关键步骤：
+ *  1. 如有设置 `transformContext`，先做一次 `AgentMessage[] → AgentMessage[]`
+ *     的改写（例如裁剪、压缩、注入记忆等）。
+ *  2. 再用 `convertToLlm` 折叠为 LLM 可理解的 `Message[]`。
+ *  3. 如配置了 `getApiKey`，每轮实时取一次密钥（配合会过期的 OAuth token
+ *     或需要刷新的 Bedrock 权证）。
+ *  4. 将上游的流式事件映射成本层 `message_start` / `message_update` /
+ *     `message_end`；流结束时拿最终 `AssistantMessage` 回填到 context 和
+ *     `newMessages` 中。
  */
 async function streamAssistantResponse(
 	context: AgentContext,
@@ -331,7 +378,11 @@ async function streamAssistantResponse(
 }
 
 /**
- * Execute tool calls from an assistant message.
+ * 执行助手消息里包含的所有 tool call。
+ *
+ * 如果 `config.toolExecution === "sequential"`，或任一 tool 声明自己的
+ * `executionMode` 为 `"sequential"`，则走串行分支；否则并行分支会先同时
+ * 跳出 `tool_execution_start`，再按顺序 await 每个工具的 `execute()`。
  */
 async function executeToolCalls(
 	currentContext: AgentContext,

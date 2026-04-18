@@ -1,4 +1,29 @@
 #!/usr/bin/env node
+/**
+ * `pi-pods` 的 CLI 入口（对外命令 `pi`，同名但与 coding-agent 的 `pi` 是不同的
+ * 可执行文件；此处通过 bin 安装成另一个名字或单独使用）。
+ *
+ * 职责：在 GPU pod 上部署、管理 vLLM 服务和模型。整个包不含 agent / TUI 代码，
+ * 纯命令行，状态保存在 `~/.pi/config.json`（可被 `PI_CONFIG_DIR` 覆盖）。
+ *
+ * 子命令分组：
+ *
+ *  - pod 管理（见 `./commands/pods.ts`）：
+ *      `pi pods setup <name> "<ssh>" --mount ...`   远程安装 + 挂载
+ *      `pi pods` / `active` / `remove`              列出 / 切换激活 / 移除
+ *      `pi shell` / `pi ssh "<cmd>"`                交互式 / 非交互 SSH
+ *
+ *  - 模型管理（见 `./commands/models.ts`）：
+ *      `pi start <model>` / `stop` / `list` / `logs` 启动、停止、查看 vLLM 进程
+ *      `pi known`                                    显示内置支持的模型列表
+ *
+ *  - 直接对话：`pi agent <name> [prompt] [options]`（见 `./commands/prompt.js`），
+ *    把 vLLM endpoint 当 OpenAI 兼容 API 喂给 coding-agent 使用。
+ *
+ * 所有命令都接受 `--pod <name>` 覆盖当前激活 pod；远程执行走 `./ssh.ts` 里的
+ * `sshExec` / `sshExecStream`。本文件只做参数解析与派发，具体业务在 `commands/`。
+ */
+
 import chalk from "chalk";
 import { spawn } from "child_process";
 import { readFileSync } from "fs";

@@ -1,3 +1,22 @@
+/**
+ * pod 级别的命令实现（`pi pods ...`）。
+ *
+ * 这里没有“服务”概念，只是对 `~/.pi/config.json` 的增删改 + 通过 SSH 在远程
+ * pod 上跑一次性安装 / 诊断脚本。默认的三种操作：
+ *
+ *  - `listPods()`         ：遍历本地配置，打印 pod 列表（带 GPU 数量、vLLM 版本、
+ *                           激活标记）。
+ *  - `setupPod(name, ssh, { mount, modelsPath, vllm })`：
+ *      1. 校验 `HF_TOKEN` / `PI_API_KEY` 环境变量。
+ *      2. SSH 到远程，探测 GPU（`nvidia-smi`）、检查已装驱动。
+ *      3. 按 `--vllm release|nightly|gpt-oss` 选择的分支安装 vLLM（release 要求 >=0.10.0）。
+ *      4. 执行用户提供的 `--mount` 脚本挂载模型目录，记录 `modelsPath`。
+ *      5. 把结果写回 `config.json` 并把新 pod 设为激活。
+ *  - `switchActivePod(name)` / `removePodCommand(name)`：纯本地配置操作。
+ *
+ * 远程调用统一走 `../ssh.ts`；所有写入都经过 `../config.ts` 以保证原子性。
+ */
+
 import chalk from "chalk";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";

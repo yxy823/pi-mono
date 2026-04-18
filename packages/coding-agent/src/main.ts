@@ -1,8 +1,29 @@
 /**
- * Main entry point for the coding agent CLI.
+ * `pi`（coding-agent）命令行的主入口。
  *
- * This file handles CLI argument parsing and translates them into
- * createAgentSession() options. The SDK does the heavy lifting.
+ * 本文件只承担 **“CLI → SDK options”** 的翻译工作：解析 argv、读取配置、组装一组
+ * `CreateAgentSessionOptions`，然后交给 `./core/sdk.ts` 背后的 `createAgentSession`
+ * 生成真正的运行时；之后再根据模式跳到 `./modes/` 下对应的 runner：
+ *
+ *  - `interactive`：TTY 下的 TUI 交互（默认模式）。
+ *  - `print`：以纯文本一次性打印结果（`--print` 或 stdin 非 TTY 时）。
+ *  - `json`：同 `print`，但输出结构化 JSON（`--mode json`）。
+ *  - `rpc`：作为 RPC 服务供其它进程驱动（`--mode rpc`）。
+ *
+ * 关键职责：
+ *
+ *  - 会话管理：按 `--session` / `--continue` / `--resume` / `--fork` / `--no-session`
+ *    解析出要用哪个 `SessionManager`（路径匹配、跨项目 fork 交互式确认等）。
+ *  - 初始消息组装：合并 positional 文件参数、stdin pipe 的内容、`--message` 等为
+ *    首条用户消息（见 `./cli/initial-message.ts`、`./cli/file-processor.ts`）。
+ *  - 模型与 scope 解析：`--model` / `--provider` / 配置文件中保存的偏好共同决定
+ *    最终使用的模型（见 `./core/model-resolver.ts`）。
+ *  - 扩展（extension）加载：`--extension` / 自动发现的本地扩展工厂在此被挑出来
+ *    注入到 session。
+ *  - 诊断信息：`SettingsManager` 读取多 scope 配置过程中产生的 warning 会在这里
+ *    汇总、按等级着色打印到 stderr。
+ *  - 其它零散命令：`pi config ...` / `pi package ...`（包管理子命令）在进入 session
+ *    之前就分流了。
  */
 
 import { resolve } from "node:path";

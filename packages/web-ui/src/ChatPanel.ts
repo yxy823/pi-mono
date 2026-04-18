@@ -1,3 +1,28 @@
+/**
+ * `ChatPanel` —— `pi-web-ui` 的最高层 chat 布局组件。
+ *
+ * 在一个 `<pi-chat-panel>` 里聚合了：
+ *  - `AgentInterface`   ：消息列表 + 输入框 + 模型 / 思考等级 / 附件选择。
+ *  - `ArtifactsPanel`   ：agent 产生的 HTML / 图像 / Markdown / SVG 等
+ *                         artifacts 的预览面板。
+ *
+ * 布局策略：根据 `window.innerWidth` 与 `BREAKPOINT` 关系决定是走并排布局
+ * 还是 overlay 式展开；artifacts 面板的显 / 隐由 `showArtifactsPanel` 控制，
+ * 在产生新 artifact 时会自动弹出。
+ *
+ * `setAgent(agent, config?)` 是外部宣備好的 `Agent` 后的 **唯一关键入口**：它
+ * 负责：
+ *  - 创建 `AgentInterface` 和 `ArtifactsPanel` 的实例并配置回调（要求 API key、
+ *    发送前 hook、点击费用 / 模型的跳转等）。
+ *  - 注册 `ArtifactsToolRenderer`，将 `artifacts` 工具的输出渲染到面板里。
+ *  - 准备 `runtimeProvidersFactory`：让 sandbox 里的 JS REPL / 自定义工具有读写
+ *    artifact 和附件的能力。
+ *  - 把外部传入的 `toolsFactory` 产生的工具挂到 `agent` 上。
+ *
+ * `BREAKPOINT` 是 overlay / side-by-side 的切换阈值，与 `AgentInterface` 内部
+ * 的响应式逻辑保持一致。
+ */
+
 import { Badge } from "@mariozechner/mini-lit/dist/Badge.js";
 import { html, LitElement } from "lit";
 import { customElement, state } from "lit/decorators.js";
