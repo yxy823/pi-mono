@@ -348,7 +348,31 @@ export class AgentSession {
 	// Base system prompt (without extension appends) - used to apply fresh appends each turn
 	private _baseSystemPrompt = "";
 
+	/**
+	 * 构造器做的事情分三段：
+	 *
+	 *  (1) 把 config 里的依赖“摊”到实例字段上 —— `agent`（pi-agent-core 的 Agent 实例）、
+	 *      `sessionManager`（负责把每条消息写到磁盘 session 文件）、`settingsManager`
+	 *      （全局设置，例如默认 thinking level）、`resourceLoader`（读 .pi/** 资源）、
+	 *      `customTools`、`cwd`、`modelRegistry`（根据 model.provider 决定 API key 来源）等。
+	 *
+	 *  (2) 订阅 Agent 的事件流：
+	 *      - `agent.subscribe(this._handleAgentEvent)` 把 agent-loop 发的所有
+	 *        AgentEvent 都喂给 `_handleAgentEvent`，由它负责“写 session、转发给
+	 *        extension、喂给 UI 监听者、触发 auto-compaction / retry 判断”。
+	 *      - `_installAgentToolHooks` 往 Agent 上挂 beforeToolCall/afterToolCall hook，
+	 *        让扩展 / 权限门 / 统计等逻辑能在工具执行前后介入。
+	 *
+	 *  (3) `_buildRuntime(...)` 构建本次 session 的运行时环境：根据 `initialActiveToolNames`
+	 *      和扩展注册的 custom tools，拼出最终的 tool 注册表、prompt snippet、guidelines，
+	 *      再把它们同步到 `agent.tools` / `agent.systemPrompt`。
+	 *
+	 *  关键点：构造器里 **不发送任何消息**、**不启动任何 LLM 调用**。
+	 *  真正的交互从外部调用 `prompt()` 开始。这样设计让 session 可以在“空壳”
+	 *  状态下被拿来做很多准备工作（注册 listener、切换活动工具、加载扩展）。
+	 */
 	constructor(config: AgentSessionConfig) {
+		// (1) 基础依赖落地。所有字段一次性拷到实例，不再重新读 config。
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
 		this.settingsManager = config.settingsManager;
@@ -360,13 +384,18 @@ export class AgentSession {
 		this._extensionRunnerRef = config.extensionRunnerRef;
 		this._initialActiveToolNames = config.initialActiveToolNames;
 		this._baseToolsOverride = config.baseToolsOverride;
+		// session_start 事件用于扩展加载时分辨“冷启动 / 从文件恢复”等不同来源。
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
 
-		// Always subscribe to agent events for internal handling
-		// (session persistence, extensions, auto-compaction, retry logic)
+		// (2) 订阅 agent 事件。这是 session 能做任何事情的前提 —— 没有它就收不到
+		//     assistant 流 / tool 调用 / turn 开始结束等信号。返回的 unsubscribe 存起来，
+		//     dispose() 时清理避免内存泄漏。
 		this._unsubscribeAgent = this.agent.subscribe(this._handleAgentEvent);
+		// 安装 beforeToolCall / afterToolCall hook，绑定扩展系统和权限门。
 		this._installAgentToolHooks();
 
+		// (3) 构建运行时：根据活动工具列表 + 扩展的 custom tools 生成最终 tools
+		//     + system prompt，并同步到 agent.tools / agent.systemPrompt。
 		this._buildRuntime({
 			activeToolNames: this._initialActiveToolNames,
 			includeAllExtensionTools: true,
@@ -979,24 +1008,49 @@ export class AgentSession {
 	 * @throws Error if streaming and no streamingBehavior specified
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
+	/**
+	 * 用户发起一轮对话的 **主入口**。
+	 *
+	 * 走完一次 prompt 要经历这样的流水线（按顺序）：
+	 *
+	 *   1) 扩展命令（以 `/` 开头）——  例如 `/login`、`/help`，由扩展自己消化掉，
+	 *      不会走到 LLM；
+	 *   2) extension `input` 事件 ——  扩展可以“handled”直接截胡（不发 LLM），
+	 *      也可以 “transform” 改写文本 / 图像；
+	 *   3) skill / prompt template 展开 ——  `/skill:xxx` 或用户自己定义的模板
+	 *      会被替换成真实内容；
+	 *   4) 如果现在还在流式响应中，走 steer / followUp 队列而不是重新起一轮；
+	 *   5) flush 之前没来得及写进 transcript 的 bash 执行记录；
+	 *   6) 选模型 / 校验 auth（API key / OAuth）；
+	 *   7) 检查是否需要在发消息前先跑一次 context compaction（上一轮可能被 abort）；
+	 *   8) 拼 user message（text + 可选 image），再附上这次该一起发的 nextTurn
+	 *      注入消息（aside）、并给扩展一次在消息 / systemPrompt 上做修改的机会；
+	 *   9) 一切就绪，交给 `agent.prompt(messages)` —— 真正的 5 步循环在
+	 *      `agent-loop.ts` 里发生；
+	 *   10) `waitForRetry()` 等 agent-loop 自动 retry 跑完（如果发生 overflow 等）。
+	 *
+	 * `preflightResult?.(ok)` —— 上层 UI 用来知道“确认送出了吗？还是失败了不要清输入框”。
+	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		// 默认允许展开 `/skill:xxx` / 模板；有时（例如从 session 回放）我们明确不想展开。
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const preflightResult = options?.preflightResult;
 		let messages: AgentMessage[] | undefined;
 
 		try {
-			// Handle extension commands first (execute immediately, even during streaming)
-			// Extension commands manage their own LLM interaction via pi.sendMessage()
+			// (1) 扩展注册的命令。即使 agent 正在流式响应，这些命令也应立即执行
+			//     —— 例如 /abort 需要能在 busy 时打断。所以放在最前面。
 			if (expandPromptTemplates && text.startsWith("/")) {
 				const handled = await this._tryExecuteExtensionCommand(text);
 				if (handled) {
-					// Extension command executed, no prompt to send
+					// 命令吃掉了这次输入：告诉 UI 成功送达，直接 return 不进 LLM 流。
 					preflightResult?.(true);
 					return;
 				}
 			}
 
-			// Emit input event for extension interception (before skill/template expansion)
+			// (2) extension `input` hook：扩展可以 transform（改文本/图像）或 handled（整段吃掉）。
+			//     类似一层“中间件”，比命令更通用，任何普通用户输入都会经过它。
 			let currentText = text;
 			let currentImages = options?.images;
 			if (this._extensionRunner?.hasHandlers("input")) {
@@ -1015,14 +1069,19 @@ export class AgentSession {
 				}
 			}
 
-			// Expand skill commands (/skill:name args) and prompt templates (/template args)
+			// (3) skill 展开（/skill:name args → 完整 skill body）+ 模板展开
+			//     （/my-template arg1 arg2 → 模板渲染结果）。两步都是纯文本替换。
 			let expandedText = currentText;
 			if (expandPromptTemplates) {
 				expandedText = this._expandSkillCommand(expandedText);
 				expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 			}
 
-			// If streaming, queue via steer() or followUp() based on option
+			// (4) 正在 streaming 中：说明 agent 没空接新 turn。
+			//     根据调用方显式给的 streamingBehavior 决定排队方式：
+			//       - "steer"    →  塞进当前 turn 中，下一次 LLM call 前追加一条 user 消息；
+			//       - "followUp" →  等当前 turn 完全收尾后再开新 turn；
+			//     调用方没指定的话我们不替它做决策，直接抛错让上层感知。
 			if (this.isStreaming) {
 				if (!options?.streamingBehavior) {
 					throw new Error(
@@ -1038,10 +1097,12 @@ export class AgentSession {
 				return;
 			}
 
-			// Flush any pending bash messages before the new prompt
+			// (5) 有些 bash 调用是以 `user_bash` 形式发生在非 agent turn 内的，
+			//     它们的 transcript 条目积在一个 pending 队列，这里在正式开 turn 前
+			//     一次性 flush 到 messages，保证顺序和 UI 看到的一致。
 			this._flushPendingBashMessages();
 
-			// Validate model
+			// (6) 选模型 + 校验授权。
 			if (!this.model) {
 				throw new Error(
 					"No model selected.\n\n" +
@@ -1051,6 +1112,7 @@ export class AgentSession {
 			}
 
 			if (!this._modelRegistry.hasConfiguredAuth(this.model)) {
+				// OAuth 的报错文案要引导去 /login；普通 API key 的引导去设环境变量或 /login。
 				const isOAuth = this._modelRegistry.isUsingOAuth(this.model);
 				if (isOAuth) {
 					throw new Error(
@@ -1065,16 +1127,19 @@ export class AgentSession {
 				);
 			}
 
-			// Check if we need to compact before sending (catches aborted responses)
+			// (7) compaction 前置检查。上一轮 LLM 回复可能被用户 abort 留下了
+			//     超出窗口的 transcript —— 在下次真正发 prompt 前先评估 / 压缩，
+			//     避免第一次请求就被 context overflow 打回来。
 			const lastAssistant = this._findLastAssistantMessage();
 			if (lastAssistant) {
 				await this._checkCompaction(lastAssistant, false);
 			}
 
-			// Build messages array (custom message if any, then user message)
+			// (8) 构造发给 Agent 的 `messages[]`。
 			messages = [];
 
-			// Add user message
+			// 8a. 主 user 消息：text + 可选图像。注意这里把 text 放在前、images 放在后，
+			//     是 provider 通用的稳定顺序。
 			const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: expandedText }];
 			if (currentImages) {
 				userContent.push(...currentImages);
@@ -1085,21 +1150,23 @@ export class AgentSession {
 				timestamp: Date.now(),
 			});
 
-			// Inject any pending "nextTurn" messages as context alongside the user message
+			// 8b. “下一轮一起发”的 aside 消息（例如某些扩展想在下条 user 之后插一段 context）。
+			//     发完一次就清空，不会重复出现在后续 turn 里。
 			for (const msg of this._pendingNextTurnMessages) {
 				messages.push(msg);
 			}
 			this._pendingNextTurnMessages = [];
 
-			// Emit before_agent_start extension event
+			// 8c. extension before_agent_start：扩展的最后一次机会往本轮 messages 里塞
+			//     自定义消息、或者改写 systemPrompt。
 			if (this._extensionRunner) {
 				const result = await this._extensionRunner.emitBeforeAgentStart(
 					expandedText,
 					currentImages,
 					this._baseSystemPrompt,
 				);
-				// Add all custom messages from extensions
 				if (result?.messages) {
+					// 扩展给的都是 custom role 消息（不会被误当作 assistant / user）。
 					for (const msg of result.messages) {
 						messages.push({
 							role: "custom",
@@ -1111,15 +1178,16 @@ export class AgentSession {
 						});
 					}
 				}
-				// Apply extension-modified system prompt, or reset to base
+				// systemPrompt：如果扩展返回了就用它；没有则 **强制** 回退到 base，
+				// 这样上一轮残留的修改不会泄露到下一轮。
 				if (result?.systemPrompt) {
 					this.agent.state.systemPrompt = result.systemPrompt;
 				} else {
-					// Ensure we're using the base prompt (in case previous turn had modifications)
 					this.agent.state.systemPrompt = this._baseSystemPrompt;
 				}
 			}
 		} catch (error) {
+			// 任何准备阶段的异常：告诉 UI 发送失败，再把异常继续抛给调用方展示。
 			preflightResult?.(false);
 			throw error;
 		}
@@ -1128,8 +1196,13 @@ export class AgentSession {
 			return;
 		}
 
+		// (9) 正式把 messages 交给 pi-agent-core 的 Agent。Agent 内部会启动
+		//     agent-loop：调 LLM → 解析 tool_call → 执行 → 再调 LLM，直到没有
+		//     新工具调用为止。本函数不等单条 LLM 回复，只等整个 turn 结束。
 		preflightResult?.(true);
 		await this.agent.prompt(messages);
+		// (10) agent 可能在内部触发 auto retry（例如 context overflow → 压缩后重试）。
+		//      这里等它彻底 settle，再把控制权还给调用方。
 		await this.waitForRetry();
 	}
 

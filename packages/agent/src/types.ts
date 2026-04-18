@@ -1,3 +1,21 @@
+/**
+ * `@mariozechner/pi-agent-core` 的核心类型定义。
+ *
+ * 这个文件基本上是整个包的“API 形状图”：
+ *
+ *  - `AgentMessage`            —— transcript 中一条消息。是 pi-ai 的标准 `Message`
+ *                                 union 加上应用侧通过 `CustomAgentMessages` 扩展
+ *                                 出的额外角色（例如 UI-only notification）。
+ *  - `AgentContext`            —— 发给 LLM 的“切片快照”：systemPrompt + messages + tools。
+ *  - `AgentTool`               —— 工具定义，继承 pi-ai 的 `Tool` 再附加 UI / 执行策略字段。
+ *  - `AgentState`              —— Agent 类暴露给外部观察 / 修改的状态（只读 + setter 语义）。
+ *  - `AgentEvent`              —— 事件流的离散状态机：agent → turn → message → tool_execution
+ *                                 四层嵌套生命周期。见下方 `AgentEvent` 的详细注释。
+ *  - `AgentLoopConfig`         —— 一次性喂给 loop 的“怎么跑”配置（模型、kv、各种 hook）。
+ *  - `BeforeToolCallResult` / `AfterToolCallResult` —— hook 返回值协议。
+ *
+ * 这里大部分结构 **不含实现逻辑**；实现在 `./agent-loop.ts` 与 `./agent.ts`。
+ */
 import type {
 	AssistantMessage,
 	AssistantMessageEvent,
@@ -238,17 +256,24 @@ export interface CustomAgentMessages {
 }
 
 /**
- * AgentMessage: Union of LLM messages + custom messages.
- * This abstraction allows apps to add custom message types while maintaining
- * type safety and compatibility with the base LLM messages.
+ * `AgentMessage`：transcript 中一条消息的类型。
+ *
+ * 是 pi-ai 的标准 `Message`（user / assistant / toolResult）加上应用侧通过
+ * declaration merging 扩展出的自定义角色（如 UI-only notification、artifact
+ * 记录等）。loop 内部统一用 `AgentMessage`，只在调用 LLM 那一个边界上用
+ * `convertToLlm` 把这些扩展角色折叠 / 过滤成 LLM 能懂的 `Message[]`。
  */
 export type AgentMessage = Message | CustomAgentMessages[keyof CustomAgentMessages];
 
 /**
- * Public agent state.
+ * Agent 对外暴露的状态门面。
  *
- * `tools` and `messages` use accessor properties so implementations can copy
- * assigned arrays before storing them.
+ * 一些字段（`tools` / `messages`）使用 getter/setter 而不是普通字段，
+ * 是因为实现方在 set 时会 **浅拷贝传入的数组**，避免外部继续持有同一引用
+ * 然后在 loop 跑的时候污染 transcript。
+ *
+ * 只读字段（`isStreaming`、`streamingMessage`、`pendingToolCalls`、
+ * `errorMessage`）反映当前 run 的瞬时状态，供 UI 做进度 / 按钮禁用判断。
  */
 export interface AgentState {
 	/** System prompt sent with each model request. */
@@ -325,25 +350,52 @@ export interface AgentContext {
 }
 
 /**
- * Events emitted by the Agent for UI updates.
+ * Agent 事件流的“离散状态机”。
  *
- * `agent_end` is the last event emitted for a run, but awaited `Agent.subscribe()`
- * listeners for that event are still part of run settlement. The agent becomes
- * idle only after those listeners finish.
+ * 事件分四层，按 **层级嵌套** 发生：
+ *
+ * ```
+ * agent_start
+ *   └─ turn_start               ┐
+ *        └─ message_start       │    一个 turn =
+ *        │    [message_update]* │    一条 assistant message
+ *        └─ message_end         │    + 0..N 次 tool 调用
+ *        └─ tool_execution_start┤    + 对应的 toolResult 消息
+ *        │    [tool_execution_update]*
+ *        └─ tool_execution_end  │
+ *        └─ message_start(toolResult)
+ *        └─ message_end(toolResult)
+ *      turn_end                 ┘
+ *   [turn_start ... turn_end]*       （视需要有多轮）
+ * agent_end
+ * ```
+ *
+ * 关键约束：
+ *  - 每次 run 只发一次 `agent_start` 和一次 `agent_end`。
+ *  - `agent_end` 事件里带的 `messages` 就是这次 run 新追加的所有消息，
+ *    上层保存 transcript 时以它为准。
+ *  - 流式输出时只有 **assistant 消息** 会收到 `message_update`；其它角色
+ *    只有成对的 start/end。
+ *  - 工具生命周期可能完全在一个 turn 内结束（并行 / 串行执行都如此）。
+ *  - **settlement 语义**：`agent_end` 是最后一个事件，但 `Agent.subscribe`
+ *    中 await 的监听器仍算在 run 的收尾时间内；Agent 真正变 idle 要等
+ *    这些监听器 resolve 之后。
+ *
+ * UI 端通常以这套事件为真源来渲染消息流 / 工具卡片 / spinner 状态。
  */
 export type AgentEvent =
-	// Agent lifecycle
+	// —— Agent 层：一次 run 从 start 到 end ——
 	| { type: "agent_start" }
 	| { type: "agent_end"; messages: AgentMessage[] }
-	// Turn lifecycle - a turn is one assistant response + any tool calls/results
+	// —— Turn 层：一个 turn = 一条 assistant 消息 + 配套的 toolCall/toolResult ——
 	| { type: "turn_start" }
 	| { type: "turn_end"; message: AgentMessage; toolResults: ToolResultMessage[] }
-	// Message lifecycle - emitted for user, assistant, and toolResult messages
+	// —— Message 层：user / assistant / toolResult 三种角色都会成对发 start/end ——
 	| { type: "message_start"; message: AgentMessage }
-	// Only emitted for assistant messages during streaming
+	// 只对 assistant 发：每次 provider 送来 delta 都发一次，携带原始事件
 	| { type: "message_update"; message: AgentMessage; assistantMessageEvent: AssistantMessageEvent }
 	| { type: "message_end"; message: AgentMessage }
-	// Tool execution lifecycle
+	// —— Tool 层：对 assistant.content 里的每个 toolCall 都会发成对 start/end ——
 	| { type: "tool_execution_start"; toolCallId: string; toolName: string; args: any }
 	| { type: "tool_execution_update"; toolCallId: string; toolName: string; args: any; partialResult: any }
 	| { type: "tool_execution_end"; toolCallId: string; toolName: string; result: any; isError: boolean };

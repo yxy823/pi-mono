@@ -1,3 +1,23 @@
+/**
+ * `bash` 工具 —— coding-agent 最常被 LLM 调用的工具之一。
+ *
+ * 职责：
+ *  1. 在工作目录下启动一个 shell 子进程执行命令；
+ *  2. 实时把 stdout / stderr 以 `onUpdate` 回调方式流式回传（驱动 TUI 卡片实时刷新）；
+ *  3. 对长输出做 **rolling tail 截断**（默认保留最后 ~200 行 / 50KB），
+ *     超出的部分同步写到 `/tmp/pi-bash-<id>.log` 文件，最终结果里指明路径；
+ *  4. 支持 timeout / AbortSignal：命中就杀掉整个进程组（`killProcessTree`），
+ *     以免 shell 下面派生的子孙进程“逃逸”；
+ *  5. 通过 `BashOperations` 抽象，外部可以换掉本地 exec 走 SSH / 容器等。
+ *
+ * 关键不变量：
+ *  - 子进程是 `detached: true` 启动的（见 `createLocalBashOperations`）：
+ *    这样 shell 的所有子孙进程会进入同一个进程组，一次杀组就能全部干掉。
+ *  - stdio: ["ignore", "pipe", "pipe"] —— 我们不接管 stdin，所以交互式命令会
+ *    看到 EOF 立刻结束；这是有意设计，避免 agent 被 `read` / `passwd` 类命令挂住。
+ *  - 同时维护“进程级”PID 跟踪（`trackDetachedChildPid`），为的是 agent 整体退出
+ *    时还能清理掉残留子进程。
+ */
 import { randomBytes } from "node:crypto";
 import { createWriteStream, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -67,54 +87,85 @@ export interface BashOperations {
 }
 
 /**
- * Create bash operations using pi's built-in local shell execution backend.
+ * 默认的本地 exec 实现（命令 → 本机 shell）。
  *
- * This is useful for extensions that intercept user_bash and still want pi's
- * standard local shell behavior while wrapping or rewriting commands.
+ * 提供两条“外部接入 pi 标准本地 shell 行为”的路径：
+ *  1) 直接用作 `BashOperations`；
+ *  2) 被扩展包装：扩展拦截 `user_bash`、改写 / 加 prefix，然后仍委托到这里跑。
+ *
+ * 这个函数是整个 bash 工具和操作系统进程模型交互的 **唯一地方**，后面流程里
+ * 任何“为什么要这么写”的问题基本都指向这段。
  */
 export function createLocalBashOperations(): BashOperations {
 	return {
 		exec: (command, cwd, { onData, signal, timeout, env }) => {
+			// 用 Promise 包裹整个进程生命周期：resolve=进程正常结束（带 exitCode），
+			// reject=aborted / timeout / spawn 错误。
 			return new Promise((resolve, reject) => {
+				// 从 ~/.pi-shellrc / PATH / SHELL 等处推导“用哪个 shell + 哪些参数”。
 				const { shell, args } = getShellConfig();
+				// 提前校验 cwd：spawn 在 cwd 不存在时会发一个比较隐晦的 ENOENT，
+				// 这里直接抛结构化错误让 LLM 一眼能懂。
 				if (!existsSync(cwd)) {
 					reject(new Error(`Working directory does not exist: ${cwd}\nCannot execute bash commands.`));
 					return;
 				}
+				// ========== 真正 spawn 子进程 ==========
+				// shell = bash/zsh/sh 等；args 通常包括 -c 之类；命令作为最后一个 arg
+				// 让 shell 负责解析。detached=true 让子进程成为新进程组的 leader —— 这样
+				// 后面能用 `killProcessTree(pid)`（本质是 `kill -SIGKILL -pid`）一次性干
+				// 掉整个子孙树，避免 shell 启起来的后台进程变孤儿。
 				const child = spawn(shell, [...args, command], {
 					cwd,
 					detached: true,
 					env: env ?? getShellEnv(),
+					// stdin 被 ignore：交互式命令看到 EOF 立即退出，agent 不会卡住。
+					// stdout/stderr pipe：我们要流式读取它们的数据。
 					stdio: ["ignore", "pipe", "pipe"],
 				});
+				// 把 pid 记录到全局表，coding-agent 整体退出时可以挨个清理。
 				if (child.pid) trackDetachedChildPid(child.pid);
+
+				// 标记 timeout 是否已触发（跟 abort 区分，最后 reject 的消息不同）。
 				let timedOut = false;
 				let timeoutHandle: NodeJS.Timeout | undefined;
-				// Set timeout if provided.
+				// ========== 可选 timeout ==========
 				if (timeout !== undefined && timeout > 0) {
 					timeoutHandle = setTimeout(() => {
 						timedOut = true;
+						// 直接杀整个进程组，不再等孩子“自愿”退出。
 						if (child.pid) killProcessTree(child.pid);
 					}, timeout * 1000);
 				}
-				// Stream stdout and stderr.
+
+				// ========== 输出流订阅 ==========
+				// stdout + stderr 统一走 onData，上层拿到的是 *未区分两条流* 的合并流，
+				// 和用户在真 shell 里看到的顺序最接近。
 				child.stdout?.on("data", onData);
 				child.stderr?.on("data", onData);
-				// Handle abort signal by killing the entire process tree.
+
+				// ========== AbortSignal 链路 ==========
+				// agent 端取消（用户按 Esc / 上游 abort）就走这里杀进程组。
 				const onAbort = () => {
 					if (child.pid) killProcessTree(child.pid);
 				};
 				if (signal) {
+					// 可能进函数时 signal 已经是 aborted 状态：同步先杀一次。
 					if (signal.aborted) onAbort();
 					else signal.addEventListener("abort", onAbort, { once: true });
 				}
-				// Handle shell spawn errors and wait for the process to terminate without hanging
-				// on inherited stdio handles held by detached descendants.
+
+				// ========== 等进程收尾 ==========
+				// 不直接用 child.on("exit"/"close")：`detached` 子进程的孙子如果还持有
+				// stdout 句柄，close 会被一直 hang 住。`waitForChildProcess` 做了超时 /
+				// fallback 处理，保证总会 resolve 出一个 exit code。
 				waitForChildProcess(child)
 					.then((code) => {
+						// 进程真的退出：先做收尾（取消 pid 跟踪、清 timer、摘 abort 监听）。
 						if (child.pid) untrackDetachedChildPid(child.pid);
 						if (timeoutHandle) clearTimeout(timeoutHandle);
 						if (signal) signal.removeEventListener("abort", onAbort);
+						// 优先级：abort > timeout > 正常退出。上层用错误消息关键字分派行为。
 						if (signal?.aborted) {
 							reject(new Error("aborted"));
 							return;
@@ -126,6 +177,7 @@ export function createLocalBashOperations(): BashOperations {
 						resolve({ exitCode: code });
 					})
 					.catch((err) => {
+						// spawn 本身失败（例如 shell 可执行找不到）：同样做清理再 reject。
 						if (child.pid) untrackDetachedChildPid(child.pid);
 						if (timeoutHandle) clearTimeout(timeoutHandle);
 						if (signal) signal.removeEventListener("abort", onAbort);
@@ -288,19 +340,32 @@ export function createBashToolDefinition(
 			onUpdate?,
 			_ctx?,
 		) {
+			// 1) 如果配置了全局 prefix（例如先 `source ~/.zshrc` 或先 `conda activate`），
+			//    拼到命令最前面。用换行分隔，哪怕 prefix 最后没分号也不会把命令粘成一行。
 			const resolvedCommand = commandPrefix ? `${commandPrefix}\n${command}` : command;
+			// 2) spawnHook 允许扩展最终改写 command/cwd/env（例如走远程 SSH / 容器）。
 			const spawnContext = resolveSpawnContext(resolvedCommand, cwd, spawnHook);
+			// 3) 先 emit 一个“空 update”让 UI 把工具卡片显示成“运行中”状态，
+			//    即使命令第一行输出还没来，用户也能看到进度。
 			if (onUpdate) {
 				onUpdate({ content: [], details: undefined });
 			}
 			return new Promise((resolve, reject) => {
+				// ---------- 输出缓冲策略 ----------
+				// `tempFilePath` / `tempFileStream`：一旦总输出超过内存阈值，
+				// 就开始同步写到 /tmp 下的日志文件，事后结果里会告诉 LLM 全量路径。
 				let tempFilePath: string | undefined;
 				let tempFileStream: ReturnType<typeof createWriteStream> | undefined;
+				// `totalBytes`：进程启动以来累计输出字节数（永远不减）。
 				let totalBytes = 0;
+				// `chunks` + `chunksBytes`：**rolling tail 缓冲** —— 只留最后 2×MAX 字节
+				// 的原始 buffer，后面做 tail 截断就够了；老的 chunk 会被丢弃以防内存爆炸。
 				const chunks: Buffer[] = [];
 				let chunksBytes = 0;
 				const maxChunksBytes = DEFAULT_MAX_BYTES * 2;
 
+				// “按需开 temp 文件”：第一次调用时创建，并把已缓冲的 chunks 全部补写进去，
+				// 之后再有新数据就边来边写。保证文件内容 = 进程完整输出。
 				const ensureTempFile = () => {
 					if (tempFilePath) return;
 					tempFilePath = getTempFilePath();
@@ -308,23 +373,26 @@ export function createBashToolDefinition(
 					for (const chunk of chunks) tempFileStream.write(chunk);
 				};
 
+				// 真正的 stdout/stderr 数据回调：每收到一段就走这里。
 				const handleData = (data: Buffer) => {
 					totalBytes += data.length;
-					// Start writing to a temp file once output exceeds the in-memory threshold.
+					// (a) 累计字节数过阈值 → 开 temp 文件（后面所有数据双写）。
 					if (totalBytes > DEFAULT_MAX_BYTES) {
 						ensureTempFile();
 					}
-					// Write to temp file if we have one.
+					// (b) 如果已经开了 temp 文件，新数据直接写一份进去。
 					if (tempFileStream) tempFileStream.write(data);
-					// Keep a rolling buffer of recent output for tail truncation.
+					// (c) 先把这段 append 进 rolling buffer。
 					chunks.push(data);
 					chunksBytes += data.length;
-					// Trim old chunks if the rolling buffer grows too large.
+					// (d) 滚掉最老的 chunk 直到不超阈值；至少保留一段（避免一次大 chunk 被丢光）。
 					while (chunksBytes > maxChunksBytes && chunks.length > 1) {
 						const removed = chunks.shift()!;
 						chunksBytes -= removed.length;
 					}
-					// Stream partial output using the rolling tail buffer.
+					// (e) 把当前 tail 快照走 `truncateTail` 截断成“最后 N 行 / N 字节”，
+					//     通过 onUpdate 回给 agent-loop，TUI 卡片就能实时渲染。
+					//     注意这里可能也是第一次判定“超过行数上限”，所以也需要 ensureTempFile。
 					if (onUpdate) {
 						const fullBuffer = Buffer.concat(chunks);
 						const fullText = fullBuffer.toString("utf-8");
@@ -342,32 +410,35 @@ export function createBashToolDefinition(
 					}
 				};
 
+				// ============ 真正启动子进程 ============
 				ops.exec(spawnContext.command, spawnContext.cwd, {
 					onData: handleData,
 					signal,
 					timeout,
 					env: spawnContext.env,
 				})
+					// ============ 进程正常结束 ============
 					.then(({ exitCode }) => {
-						// Combine the rolling buffer chunks.
+						// 把 rolling buffer 拼成完整 tail 字符串（注意：已经滚掉的老数据不在这里）。
 						const fullBuffer = Buffer.concat(chunks);
 						const fullOutput = fullBuffer.toString("utf-8");
-						// Apply tail truncation for the final display payload.
+						// 最终再跑一次 truncateTail，确保返回给 LLM 的是 stable 的“最后 N 行”。
 						const truncation = truncateTail(fullOutput);
 						if (truncation.truncated) {
 							ensureTempFile();
 						}
-						// Close temp file stream before building the final result.
+						// temp 文件先关，保证下面提到路径时已经 flush 完。
 						if (tempFileStream) tempFileStream.end();
+						// 如果命令真没输出任何东西，给一个占位串，避免 LLM 看到空字符串懵。
 						let outputText = truncation.content || "(no output)";
 						let details: BashToolDetails | undefined;
+						// 有截断：附上范围信息 + 全量文件路径，让 LLM 能主动再去 read 全文。
 						if (truncation.truncated) {
-							// Build truncation details and an actionable notice.
 							details = { truncation, fullOutputPath: tempFilePath };
 							const startLine = truncation.totalLines - truncation.outputLines + 1;
 							const endLine = truncation.totalLines;
 							if (truncation.lastLinePartial) {
-								// Edge case: the last line alone is larger than the byte limit.
+								// 边界情况：一行本身就比字节上限长，只能截断这一行。
 								const lastLineSize = formatSize(Buffer.byteLength(fullOutput.split("\n").pop() || "", "utf-8"));
 								outputText += `\n\n[Showing last ${formatSize(truncation.outputBytes)} of line ${endLine} (line is ${lastLineSize}). Full output: ${tempFilePath}]`;
 							} else if (truncation.truncatedBy === "lines") {
@@ -376,6 +447,8 @@ export function createBashToolDefinition(
 								outputText += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines} (${formatSize(DEFAULT_MAX_BYTES)} limit). Full output: ${tempFilePath}]`;
 							}
 						}
+						// 非零退出码：以“错误工具结果”的形式 reject，LLM 会看到退出码并决定下一步。
+						// 等于 0 或 null（被杀但还没触发 reject 路径的边界情况）视为成功。
 						if (exitCode !== 0 && exitCode !== null) {
 							outputText += `\n\nCommand exited with code ${exitCode}`;
 							reject(new Error(outputText));
@@ -383,8 +456,10 @@ export function createBashToolDefinition(
 							resolve({ content: [{ type: "text", text: outputText }], details });
 						}
 					})
+					// ============ 进程异常（abort / timeout / spawn 失败）============
 					.catch((err: Error) => {
-						// Close temp file stream and include buffered output in the error message.
+						// 同样先关 temp 文件。拼接“已收集的 tail 输出 + 错误原因”一起返给 LLM，
+						// 这样哪怕进程是被杀的，前半部分输出也不会丢，LLM 可以基于它继续诊断。
 						if (tempFileStream) tempFileStream.end();
 						const fullBuffer = Buffer.concat(chunks);
 						let output = fullBuffer.toString("utf-8");
@@ -393,11 +468,13 @@ export function createBashToolDefinition(
 							output += "Command aborted";
 							reject(new Error(output));
 						} else if (err.message.startsWith("timeout:")) {
+							// timeout:秒数 —— 从错误消息里解出秒数，给 LLM 更可读的文本。
 							const timeoutSecs = err.message.split(":")[1];
 							if (output) output += "\n\n";
 							output += `Command timed out after ${timeoutSecs} seconds`;
 							reject(new Error(output));
 						} else {
+							// 其它路径（如 cwd 不存在、shell 找不到）：原样抛。
 							reject(err);
 						}
 					});

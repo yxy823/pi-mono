@@ -1,3 +1,17 @@
+/**
+ * `write` 工具 —— 让 LLM 把一段文本完整写进一个文件（覆盖或新建）。
+ *
+ * 职责：
+ *  1. 把 LLM 给的路径按 cwd 解析成绝对路径；
+ *  2. `mkdir -p` 保证父目录存在（免得 LLM 要先调一次 bash 建目录）；
+ *  3. 通过 `WriteOperations` 抽象做最终 I/O（默认本地 `fs.writeFile`）；
+ *  4. 全程走 `withFileMutationQueue` —— 对**同一路径的并发修改**做串行化。
+ *     这是全局单写单写锁：即便同一个 assistant 消息并行发起多个对同一文件
+ *     的 edit/write，也能保证它们按顺序生效，而不会互相覆盖；
+ *  5. 支持 AbortSignal；mkdir/writeFile 前后都检查一次 aborted。
+ *
+ * 和 read 的对称关系：read 只读、write 可能产生**副作用**，所以它受互斥队列保护。
+ */
 import type { AgentTool } from "@mariozechner/pi-agent-core";
 import { Container, Text } from "@mariozechner/pi-tui";
 import { type Static, Type } from "@sinclair/typebox";
@@ -198,17 +212,22 @@ export function createWriteToolDefinition(
 			_onUpdate?,
 			_ctx?,
 		) {
+			// 解析成绝对路径。resolveToCwd：绝对路径原样返回，相对路径 join cwd。
 			const absolutePath = resolveToCwd(path, cwd);
 			const dir = dirname(absolutePath);
+			// 用“按文件路径单线程化”的队列包裹 I/O。
+			// 同一 absolutePath 上的 write / edit 会被排队，避免覆盖写竞争。
 			return withFileMutationQueue(
 				absolutePath,
 				() =>
 					new Promise<{ content: Array<{ type: "text"; text: string }>; details: undefined }>(
 						(resolve, reject) => {
+							// (0) 入队时 signal 已 abort：不做实际 I/O，直接 reject。
 							if (signal?.aborted) {
 								reject(new Error("Operation aborted"));
 								return;
 							}
+							// abort 协议：一旦 onAbort 触发，后续 resolve 会被短路。
 							let aborted = false;
 							const onAbort = () => {
 								aborted = true;
@@ -217,12 +236,14 @@ export function createWriteToolDefinition(
 							signal?.addEventListener("abort", onAbort, { once: true });
 							(async () => {
 								try {
-									// Create parent directories if needed.
+									// (1) mkdir -p 父目录。如果已经存在 recursive:true 也不会报错。
 									await ops.mkdir(dir);
 									if (aborted) return;
-									// Write the file contents.
+									// (2) 真正把 content 写进文件（utf-8）。整段覆盖 —— 原文件存在也会被替换。
 									await ops.writeFile(absolutePath, content);
 									if (aborted) return;
+									// (3) 摘 abort 监听、返回“成功”结果。
+									//     文本里附上字节数，LLM 用来做简单校验。
 									signal?.removeEventListener("abort", onAbort);
 									resolve({
 										content: [
@@ -231,6 +252,8 @@ export function createWriteToolDefinition(
 										details: undefined,
 									});
 								} catch (error: any) {
+									// I/O 错误（权限、ENOSPC 等）走这里：摘监听再 reject。
+									// 如果是 abort 先触发的，上面已经 reject 过，不再重复。
 									signal?.removeEventListener("abort", onAbort);
 									if (!aborted) reject(error);
 								}
